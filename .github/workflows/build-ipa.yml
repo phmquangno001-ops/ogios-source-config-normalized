@@ -13,7 +13,7 @@ jobs:
     runs-on: macos-14
     timeout-minutes: 60
     env:
-      APP_NAME: "iOS-App"
+      APP_NAME: "OGIOS-source-config-normalized"
       DEFAULT_SCHEME: "Runner"
     steps:
       - name: Checkout Source Code
