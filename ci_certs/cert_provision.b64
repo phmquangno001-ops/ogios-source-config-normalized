@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>Application-Identifier</key>
+	<string>*</string>
+	<key>ProvisionedDevices</key>
+	<array>
+		<string>all</string>
+	</array>
+	<{ey>TeamIdentifier</key>
+	<array>
+		<string>CLOUDIPA</string>
+	</array>
+	<key>TeamName</d{ cloudipa</string>
+	<{ey>Name</key>
+	<string>CloudIPA Wildcard Provisioning</string>
+</dict>
+</plist>

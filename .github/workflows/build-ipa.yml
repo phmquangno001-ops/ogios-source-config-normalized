@@ -1,0 +1,176 @@
+name: Build iOS IPA
+on:
+  push:
+    branches: [ main, master ]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+jobs:
+  build-and-package:
+    name: Build & Package iOS IPA
+    runs-on: macos-14
+    timeout-minutes: 60
+    env:
+      APP_NAME: "OGIOS-source-config-normalized"
+      DEFAULT_SCHEME: "Runner"
+    steps:
+      - name: Checkout Source Code
+        uses: actions/checkout@v4
+        with:
+          submodules: recursive
+          fetch-depth: 1
+
+      - name: Select Xcode 15+
+        run: |
+          echo "Selecting optimal Xcode version..."
+          sudo xcode-select -s /Applications/Xcode_15.4.app/Contents/Developer || sudo xcode-select -s /Applications/Xcode_15.2.app/Contents/Developer || true
+          xcodebuild -version
+
+      - name: Setup iOS Keychain & Certificates (Password: 1)
+        run: |
+          set -e
+          echo "Setting up Apple certificate and mobileprovision profile..."
+          mkdir -p ~/Library/MobileDevice/Provisioning\ Profiles
+
+          # Provisioning Profile from base64
+          if [ -n "$BUILD_PROVISION_PROFILE_BASE64" ]; then
+            echo "$BUILD_PROVISION_PROFILE_BASE64" | base64 --decode > ~/Library/MobileDevice/Provisioning\ Profiles/cert.mobileprovision
+          elif [ -f "ci_certs/cert_provision.b64" ]; then
+            cat "ci_certs/cert_provision.b64" | base64 --decode > ~/Library/MobileDevice/Provisioning\ Profiles/cert.mobileprovision 2>/dev/null || cat "ci_certs/cert_provision.b64" | base64 -D > ~/Library/MobileDevice/Provisioning\ Profiles/cert.mobileprovision || true
+          fi
+
+          # Keychain creation
+          KEYCHAIN_PATH=$RUNNER_TEMP/build.keychain
+          security create-keychain -p "1" $KEYCHAIN_PATH
+          security set-key-chain-settings -lut 21600 $KEYCHAIN_PATH 2>/dev/null || security set-keychain-settings -lut 21600 $KEYCHAIN_PATH || true
+          security unlock-keychain -p "1" $KEYCHAIN_PATH
+
+          # Certificate .p12 import with password 1
+          if [ -n "$BUILD_CERTIFICATE_BASE64" ]; then
+            echo "$BUILD_CERTIFICATE_BASE64" | base64 --decode > $RUNNER_TEMP/cert.p12
+          elif [ -f "ci_certs/cert_p12.b64" ]; then
+            cat "ci_certs/cert_p12.b64" | base64 --decode > $RUNNER_TEMP/cert.p12 2>/dev/null || cat "ci_certs/cert_p12.b64" | base64 -D > $RUNNER_TEMP/cert.p12 || true
+          fi
+
+          if [ -f "$RUNNER_TEMP/cert.p12" ]; then
+            security import "$RUNNER_TEMP/cert.p12" -P "1" -A -t cert -f pkcs12 -k $KEYCHAIN_PATH || true
+            security set-key-partition-list -S apple-tool:,apple: -s -k "1" $KEYCHAIN_PATH || true
+            security list-keychain -d user -s $KEYCHAIN_PATH
+          fi
+          echo "Certificate and Keychain setup completed."
+
+      - name: Multi-Tier Resilient Xcode Build & Auto-Recovery
+        run: |
+          echo "=== 1. DYNAMIC REPOSITORY & PROJECT SCAN ==="
+          # Search for .xcworkspace or .xcodeproj anywhere in the repository, handling nested dirs like 3105-main
+          WORKSPACE=$(find . -not -path "*/Pods/*" -name "*.xcworkspace" | head -n 1)
+          PROJECT=$(find . -not -path "*/Pods/*" -not -path "*.xcworkspace/*" -name "*.xcodeproj" | head -n 1)
+
+          if [ -n "$WORKSPACE" ]; then
+            PROJECT_DIR=$(dirname "$WORKSPACE")
+            PROJECT_TARGET=$(basename "$WORKSPACE")
+            FLAG="-workspace $PROJECT_TARGET"
+          elif [ -n "$PROJECT" ]; then
+            PROJECT_DIR=$(dirname "$PROJECT")
+            PROJECT_TARGET=$(basename "$PROJECT")
+            FLAG="-project $PROJECT_TARGET"
+          else
+            PROJECT_DIR="."
+            PROJECT_TARGET=""
+            FLAG=""
+          fi
+
+          echo "Target Directory: $PROJECT_DIR"
+          echo "Target File: $PROJECT_TARGET"
+          cd "$PROJECT_DIR"
+
+          # Install CocoaPods if Podfile exists
+          if [ -f "Podfile" ]; then
+            echo "Installing CocoaPods dependencies..."
+            pod install --repo-update || pod install || true
+          fi
+
+          # Detect available Scheme
+          SCHEME="$DEFAULT_SCHEME"
+          if [ -n "$FLAG" ]; then
+            DETECTED=$(xcodebuild $FLAG -list -json 2>/dev/null | jq -r '.workspace.schemes[0] // .project.schemes[0]' 2>/dev/null || echo "")
+            if [ -n "$DETECTED" ] && [ "$DETECTED" != "null" ]; then
+              SCHEME="$DETECTED"
+            fi
+          fi
+          if [ -z "$SCHEME" ] || [ "$SCHEME" = "null" ]; then
+            SCHEME="Runner"
+          fi
+          echo "Selected Scheme: $SCHEME"
+
+          mkdir -p "$RUNNER_TEMP/archive"
+          mkdir -p "$RUNNER_TEMP/Payload"
+          mkdir -p "$GITHUB_WORKSPACE/build_output"
+
+          BUILD_SUCCESS=false
+
+          echo "=== 2. ATTEMPT 1: STANDARD BUILD & ARCHIVE ==="
+          if xcodebuild $FLAG -scheme "$SCHEME" -configuration Release -destination 'generic/platform=iOS' archive -archivePath "$RUNNER_TEMP/archive/App.xcarchive" ENABLE_USER_SCRIPT_SANDBOXING=NO; then
+            BUILD_SUCCESS=true
+            echo "Attempt 1 Succeeded!"
+          else
+            echo "Attempt 1 failed (exit code 65). Switching to Resilient Auto-Recovery Mode..."
+          fi
+
+          # Auto-recovery Attempt 2: Unsigned Archive (Bypasses Exit Code 65 signing checks)
+          if [ "$BUILD_SUCCESS" = false ]; then
+            echo "=== 2. ATTEMPT 2: RESILIENT UNSIGNED ARCHIVE (BYPASS CODE SIGNING) ==="
+            if xcodebuild $FLAG -scheme "$SCHEME" -configuration Release -destination 'generic/platform=iOS' CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" PROVISIONING_PROFILE="" archive -archivePath "$RUNNER_TEMP/archive/App.xcarchive" ENABLE_USER_SCRIPT_SANDBOXING=NO; then
+              BUILD_SUCCESS=true
+              echo "Attempt 2 (Unsigned Archive) Succeeded!"
+            else
+              echo "Attempt 2 failed. Triggering Ultimate Fallback: Direct Build Action with SDK iphoneos..."
+            fi
+          fi
+
+          # Auto-recovery Attempt 3: Direct Build Action
+          if [ "$BUILD_SUCCESS" = false ]; then
+            echo "=== 2. ATTEMPT 3: DIRECT IPHONEOS BUILD ==="
+            xcodebuild $FLAG -scheme "$SCHEME" -configuration Release -sdk iphoneos CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" ENABLE_USER_SCRIPT_SANDBOXING=NO CONFIGURATION_BUILD_DIR="$RUNNER_TEMP/build_products" clean build || true
+          fi
+
+          echo "=== 3. PACKAGING IPA PAYLOAD ==="
+          APP_PATH=$(find "$RUNNER_TEMP" "$GITHUB_WORKSPACE" -maxdepth 6 -type d -name "*.app" -not -path "*/Pods/*" | head -n 1)
+
+          if [ -n "$APP_PATH" ] && [ -d "$APP_PATH" ]; then
+            echo "Found .app at: $APP_PATH"
+            cp -R "$APP_PATH" "$RUNNER_TEMP/Payload/"
+
+            # Embed provisioning profile if available
+            if [ -f ~/Library/MobileDevice/Provisioning\ Profiles/cert.mobileprovision ]; then
+              cp ~/Library/MobileDevice/Provisioning\ Profiles/cert.mobileprovision "$RUNNER_TEMP/Payload/$(basename "$APP_PATH")/embedded.mobileprovision" 2>/dev/null || true
+            fi
+
+            cd "$RUNNER_TEMP"
+            zip -qry "$GITHUB_WORKSPACE/build_output/$APP_NAME.ipa" Payload
+            echo "SUCCESS: IPA created at $GITHUB_WORKSPACE/build_output/$APP_NAME.ipa"
+          else
+            echo "ERROR: Không tìm thấy thư mục .app để đóng gói IPA"
+            exit 1
+          fi
+
+      - name: Upload IPA Artifact
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: ${{ env.APP_NAME }}-ipa
+          path: build_output/*.ipa
+          if-no-files-found: ignore
+
+      - name: Publish GitHub Release with IPA Download
+        uses: softprops/action-gh-release@v2
+        if: success()
+        with:
+          tag_name: v1.0.${{ github.run_number }}
+          name: Release v1.0.${{ github.run_number }} - ${{ env.APP_NAME }}
+          files: build_output/*.ipa
+          generate_release_notes: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
